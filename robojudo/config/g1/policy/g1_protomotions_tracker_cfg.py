@@ -30,6 +30,15 @@ class ProtoMotionsTrackerPolicyCfg(PolicyCfg):
     motion_index: int = 0
     """Index of the motion clip within a multi-motion .pt library."""
 
+    mode_blend_seconds: float = 0.5
+    """Ramp length when switching between motion and default-pose references.
+
+    The pipeline flips default-pose mode in a single control step, which steps
+    the policy's reference inputs discontinuously.  The policy ramps the
+    references over this many seconds instead.  Set to 0.0 for the old
+    instant-switch behaviour.
+    """
+
     @property
     def policy_file(self) -> str:
         if self.onnx_path is not None:

@@ -42,6 +42,18 @@ from robojudo.utils.motion_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _slerp_np(a_xyzw: np.ndarray, b_xyzw: np.ndarray, t: float) -> np.ndarray:
+    """Spherical linear interpolation between two xyzw quaternions."""
+    b = b_xyzw if float(np.dot(a_xyzw, b_xyzw)) >= 0.0 else -b_xyzw
+    d = abs(float(np.dot(a_xyzw, b)))
+    if d > 0.9995:  # nearly parallel -- lerp and renormalise
+        out = a_xyzw + t * (b - a_xyzw)
+    else:
+        theta = np.arccos(d)
+        out = (np.sin((1.0 - t) * theta) * a_xyzw + np.sin(t * theta) * b) / np.sin(theta)
+    return (out / np.linalg.norm(out)).astype(np.float32)
+
+
 @policy_registry.register
 class ProtoMotionsTrackerPolicy(Policy):
     """Policy that drives a ProtoMotions tracker via unified ONNX model.
@@ -131,6 +143,14 @@ class ProtoMotionsTrackerPolicy(Policy):
         # Resolve default standing pose from protomotions robot config.
         self._default_dof_pos = self._resolve_default_dof_pos(joint_names)
 
+        # Reference-mode blend length (see set_default_pose_mode).
+        blend_s = float(getattr(cfg_policy, "mode_blend_seconds", 0.5))
+        self._blend_steps = max(int(round(blend_s / timing["control_dt"])), 0)
+        logger.info(
+            f"[TrackerPolicy] mode blend: {blend_s:.2f}s "
+            f"({self._blend_steps} control steps)"
+        )
+
         self._heading_offset = None
         self.reset()
 
@@ -163,11 +183,44 @@ class ProtoMotionsTrackerPolicy(Policy):
 
         When enabled, the policy sees synthetic references for the default
         standing pose instead of the real motion.  Used during prepare/rampdown.
+        The switch itself is ramped: ``_blend_mix`` moves from its current
+        value to the new one over ``_blend_steps`` control steps, so the policy's
+        reference inputs stay continuous.  The pipeline flips this flag in one
+        step (``[MOTION_DONE]`` / ``[MOTION_FADE_OUT]`` / ``[MOTION_RESET]``),
+        and its own 5 s blend-out path is unreachable for policies that have
+        this method -- without the ramp the references jump in a single frame.
         """
+        if enabled == self._default_pose_mode and self._blend_step >= self._blend_steps:
+            return  # already settled in this mode
         self._default_pose_mode = enabled
         if enabled:
             self._motion_done = False
-        logger.info(f"[TrackerPolicy] default_pose_mode={'ON' if enabled else 'OFF'}")
+        # Resume from wherever the current ramp got to, so a reversal mid-blend
+        # does not snap the references.
+        self._blend_from = self._blend_mix
+        self._blend_to = 1.0 if enabled else 0.0
+        self._blend_step = 0
+        logger.info(
+            f"[TrackerPolicy] default_pose_mode={'ON' if enabled else 'OFF'} "
+            f"(ramping refs {self._blend_from:.2f} -> {self._blend_to:.0f} "
+            f"over {self._blend_steps} steps)"
+        )
+
+    @property
+    def _blending(self) -> bool:
+        return self._blend_step < self._blend_steps
+
+    def _advance_blend(self) -> float:
+        """Step the mode ramp and return the current mix (0=motion, 1=default)."""
+        if self._blend_steps <= 0:
+            self._blend_mix = self._blend_to
+            return self._blend_mix
+        if self._blend_step < self._blend_steps:
+            self._blend_step += 1
+        u = self._blend_step / self._blend_steps
+        u = u * u * (3.0 - 2.0 * u)  # smoothstep: zero slope at both ends
+        self._blend_mix = self._blend_from + (self._blend_to - self._blend_from) * u
+        return self._blend_mix
 
     def reset(self):
         self._frame = 0
@@ -179,12 +232,28 @@ class ProtoMotionsTrackerPolicy(Policy):
         self._motion_done = False
         self._paused = False
         self._default_pose_mode = False
+        # Reference-mode ramp state (0 = pure motion, 1 = pure default pose).
+        # Preserve an in-progress ramp: on [MOTION_RESET] the pipeline calls
+        # set_default_pose_mode(False) immediately before this, and snapping
+        # here would undo the ramp it just started.
+        if not hasattr(self, "_blend_mix"):
+            self._blend_mix = 0.0
+            self._blend_from = 0.0
+            self._blend_to = 0.0
+            self._blend_step = self._blend_steps
+        else:
+            self._blend_from = self._blend_mix
+            self._blend_to = 0.0
+            self._blend_step = self._blend_steps if self._blend_mix <= 0.0 else 0
 
     def reset_alignment(self):
         self._heading_offset = None
 
     def post_step_callback(self, commands=None):
-        if not self._paused and not self._default_pose_mode:
+        # Hold at the current frame while ramping *into* the motion, so the
+        # ramp does not consume the opening of the clip.
+        ramping_in = self._blending and self._blend_to == 0.0
+        if not self._paused and not self._default_pose_mode and not ramping_in:
             self._frame += 1
             if self._frame >= self._player.total_frames:
                 self._frame = self._player.total_frames - 1
@@ -210,18 +279,13 @@ class ProtoMotionsTrackerPolicy(Policy):
         # as root_local_ang_vel -- NO quat_rotate_inverse needed.
         root_local_ang_vel = np.asarray(env_data.base_ang_vel, dtype=np.float32)
 
-        if self._default_pose_mode:
-            # -- Synthetic references: hold default standing pose --
-            # Target DOFs = default standing pose, velocities = zero,
-            # anchor rotation = yaw-only from robot's current anchor (hold
-            # heading but neutral pitch/roll for stable upright standing).
-            num_steps = len(self._future_step_indices)
-            anchor_yaw_only = _extract_yaw_quat_np(anchor_rot)
-            future_anchor_rot = np.tile(anchor_yaw_only, (num_steps, 1))
-            future_dof_pos = np.tile(self._default_dof_pos, (num_steps, 1))
-            future_dof_vel = np.zeros_like(future_dof_pos)
-        else:
-            # -- Future motion references with heading alignment --
+        # -- References: motion, default pose, or a ramp between the two --
+        # mix = 0 -> pure motion, 1 -> pure default standing pose.
+        mix = self._advance_blend()
+        num_steps = len(self._future_step_indices)
+
+        if mix < 1.0:
+            # Future motion references with heading alignment.
             # Clamp each future step so it never exceeds the last valid frame.
             # This repeats the last frame's references at end-of-motion instead
             # of going out of bounds.
@@ -230,9 +294,34 @@ class ProtoMotionsTrackerPolicy(Policy):
             future_refs = self._player.get_future_references(self._frame, clamped_steps)
             future_body_rot = apply_heading_offset_np(self._heading_offset, future_refs["body_rot"])
             # Anchor-body-only rotation: [num_steps, 4]
-            future_anchor_rot = future_body_rot[:, self._anchor_idx, :]
-            future_dof_pos = future_refs["dof_pos"]
-            future_dof_vel = future_refs["dof_vel"]
+            motion_rot = future_body_rot[:, self._anchor_idx, :]
+            motion_dof_pos = future_refs["dof_pos"]
+            motion_dof_vel = future_refs["dof_vel"]
+
+        if mix > 0.0:
+            # Synthetic references: hold the default standing pose.
+            # Target DOFs = default standing pose, velocities = zero,
+            # anchor rotation = yaw-only from robot's current anchor (hold
+            # heading but neutral pitch/roll for stable upright standing).
+            anchor_yaw_only = _extract_yaw_quat_np(anchor_rot)
+            stand_rot = np.tile(anchor_yaw_only, (num_steps, 1))
+            stand_dof_pos = np.tile(self._default_dof_pos, (num_steps, 1))
+            stand_dof_vel = np.zeros_like(stand_dof_pos)
+
+        if mix <= 0.0:
+            future_anchor_rot = motion_rot
+            future_dof_pos = motion_dof_pos
+            future_dof_vel = motion_dof_vel
+        elif mix >= 1.0:
+            future_anchor_rot = stand_rot
+            future_dof_pos = stand_dof_pos
+            future_dof_vel = stand_dof_vel
+        else:
+            future_anchor_rot = np.stack(
+                [_slerp_np(motion_rot[i], stand_rot[i], mix) for i in range(num_steps)]
+            )
+            future_dof_pos = (1.0 - mix) * motion_dof_pos + mix * stand_dof_pos
+            future_dof_vel = (1.0 - mix) * motion_dof_vel + mix * stand_dof_vel
 
         # -- Build ONNX inputs --
         key_to_array = {
