@@ -132,3 +132,9 @@ assets/motions
 logs
 MUJOCO_LOG.TXT
 assets/resources
+
+# Fork: local scratch notes. The shared runbook lives in README.md instead.
+memo_*.md
+
+# Fork: per-machine Claude Code state
+.claude/settings.local.json*

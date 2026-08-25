@@ -1,3 +1,28 @@
+> ## Fork notice
+>
+> This is a fork of [HansZ8/RoboJuDo](https://github.com/HansZ8/RoboJuDo).
+> **This branch (`main`) is the upstream mirror** — it carries no project code,
+> only upstream plus this notice and the [G1 deployment
+> runbook](#-g1-deployment-runbook-fork) below. Keep it that way so upstream can
+> be merged in without conflicts.
+>
+> Project work lives on the feature branches:
+>
+> | Branch | What it adds |
+> |---|---|
+> | [`feature/protomotions-tracker`](../../tree/feature/protomotions-tracker) | ProtoMotions tracker deployment: reference-mode blending in the tracker policy, the `unitree_cpp` build patch. |
+> | [`integration/all`](../../tree/integration/all) | All feature branches merged. **This is the branch to check out for day-to-day work.** |
+>
+> Land new work on the feature branch it belongs to and merge up — don't commit
+> straight to `integration/all`.
+>
+> ```bash
+> git remote add upstream https://github.com/HansZ8/RoboJuDo.git
+> git fetch upstream && git checkout main && git merge upstream/release
+> ```
+>
+> Upstream's default branch is `release`, not `main`.
+
 <div align="center">
 <h1>RoboJuDo 🤖</h1>
 
@@ -48,6 +73,7 @@ Our framework highlights:
  - [📄Introduction](#introduction)
  - [🛠️Easy Setup](#%EF%B8%8Feasy-setup)
  - [📖Quick Start](#quick-start)
+ - [🤸 G1 Deployment Runbook (fork)](#-g1-deployment-runbook-fork)
  - [🧩 Develop and Contribute](#develop-and-contribute)
 
 
@@ -357,6 +383,144 @@ python scripts/run_tracker_pipeline.py -c g1_protomotions_tracker \
 ```
 
 For more details, check [ProtoMotionsTrackerPolicy](./docs/policy.md/#policy--protomotionstrackerpolicy).
+
+
+# 🤸 G1 Deployment Runbook (fork)
+
+*Fork-only section — the operational procedure for deploying a ProtoMotions
+tracker policy onto a real Unitree G1, written up from repeated hardware
+sessions. Upstream does not carry this.*
+
+Notation used below:
+
+| Placeholder | Meaning |
+|---|---|
+| `$ROBOJUDO` | your clone of this repository |
+| `$PROTOMOTIONS` | your ProtoMotions checkout, where policies are trained |
+| `$NET_IF` | the host network interface facing the robot (`ip -br addr` to find it) |
+| `<clip>` | motion name; `<clip>-bm-deploy` is its deploy-tracker experiment |
+
+```bash
+cd $ROBOJUDO
+conda activate robojudo
+```
+
+## Prerequisites per motion
+
+Both artifacts are produced on the ProtoMotions side:
+
+1. `$PROTOMOTIONS/results/<clip>-bm-deploy/compiled_models/unified_pipeline.onnx`
+   — an exported **deploy-tracker fine-tune**. Plain `mlp.py` policies use a
+   privileged full-state actor and can **not** be deployed.
+2. `<clip>.50fps.pt` — a 50 Hz motion cache, written by ProtoMotions'
+   `deployment/test_tracker_mujoco.py --cache-motion`.
+
+## Host setup (once per machine)
+
+```bash
+python -c "from robojudo.environment import UnitreeCppEnv"   # SDK OK if this is silent
+ip -br addr                       # find $NET_IF; give it an address on 192.168.123.0/24
+ping -c 2 192.168.123.161         # the G1 onboard PC should answer
+```
+
+- Set `net_if` in the `g1_protomotions_tracker_real` config
+  (`robojudo/config/g1/g1_cfg.py`) to `$NET_IF`. It ships as `eth0`.
+- **Firewall:** DDS multicast must be allowed on the robot-facing interface —
+  `sudo ufw allow in on $NET_IF`. Re-apply if ufw is ever reset. The symptom
+  when it is missing is distinctive: ping succeeds but RoboJuDo reports
+  `Low state data is not available`.
+- Bundled reference assets, useful as known-good baselines: the pretrained
+  NVIDIA tracker at `assets/models/g1/protomotions_tracker/unified_pipeline.onnx`
+  (the default when `--onnx-path` is omitted) and the 58-motion library
+  `assets/motions/g1/g1_bones_seed_mini.pt` — index **16** is idle, **19** a
+  short walk, **0** a jump-360. Never use index 0 as a first test.
+
+## Robot startup ritual (every session)
+
+1. Hang the robot in the gantry, feet off the ground. Power on and **wait ~1
+   minute for a full boot**, until it reaches **zero-torque mode** — the joints
+   go loose, wiggle a limb to confirm.
+2. On the Unitree remote press **L2 + R2** for debug mode. The joints switch to
+   damping and the built-in controller is suspended.
+3. Only then start the pipeline.
+
+Two log-reading notes: the self-check window is only about 3 seconds, so a
+failed start is always worth one plain retry; and
+`Motion control service shutdown successfully` is printed even with no robot
+connected, so it means nothing on its own.
+
+## Deploying a motion (escalation ladder)
+
+Each rung tests exactly one new thing. Rungs 1 and 2 use the known-good
+pretrained policy and only need repeating after a hardware or setup change, not
+for every motion.
+
+```bash
+# 0. Sim rehearsal of your motion — no robot, MuJoCo viewer.
+python scripts/run_tracker_pipeline.py -c g1_protomotions_tracker \
+    --onnx-path $PROTOMOTIONS/results/<clip>-bm-deploy/compiled_models/unified_pipeline.onnx \
+    --motion-path <path>/<clip>.50fps.pt
+
+# 1. Real robot, known-good policy, idle — validates the whole hardware chain.
+python scripts/run_tracker_pipeline.py -c g1_protomotions_tracker_real \
+    --motion-path assets/motions/g1/g1_bones_seed_mini.pt --motion-index 16
+
+# 2. Real robot, known-good policy, walk.
+python scripts/run_tracker_pipeline.py -c g1_protomotions_tracker_real \
+    --motion-path assets/motions/g1/g1_bones_seed_mini.pt --motion-index 19
+
+# 3. Real robot, your policy and your motion.
+python scripts/run_tracker_pipeline.py -c g1_protomotions_tracker_real \
+    --onnx-path $PROTOMOTIONS/results/<clip>-bm-deploy/compiled_models/unified_pipeline.onnx \
+    --motion-path <path>/<clip>.50fps.pt
+```
+
+## Operator flow during a run
+
+Ramp-up (3 s) and the policy blend (5 s) run automatically once the script
+starts. The robot then holds its default pose and waits for a trigger.
+
+**On the real robot, use the Unitree remote only, and press each button
+alone.** The keyboard bindings are simulation-only — the `press R` line in the
+log is for sim. Holding L1 or R1 changes the trigger lookup key and swallows
+the command; the vibration on L1+R1 is Unitree firmware and can be ignored.
+
+| Button | Action |
+|---|---|
+| **Y** | start / reset motion |
+| **X** | blend in |
+| **B** | blend out |
+| **A** | emergency shutdown — plain `A`, takes effect instantly |
+
+In simulation the equivalents are `r` reset, `i` respawn, `<` fade-in,
+`>` fade-out, `o` shutdown.
+
+Gantry flow: start the script while the robot hangs → let ramp and blend finish
+→ lower the gantry until the feet take the load → **Y** to start the motion →
+**B** when it is done → raise the gantry.
+
+- Three ways out, in order of reach: **A** on the remote, Ctrl-C in the
+  terminal, the gantry itself.
+- Know the risky moments before you run. Trace the final checkpoint with
+  ProtoMotions' `scripts/mujoco_rollout_trace.py` and note where tracking error
+  and balance margin are tightest — keep the gantry line honest there.
+- Clear floor space larger than the motion's footprint. Motions drift.
+
+## Troubleshooting
+
+**`Low state data is not available`** — the self check failed.
+
+1. Redo the startup ritual and rerun the script; the self-check window is ~3 s.
+2. The classic cause is the firewall: ping works but DDS is silent. Apply
+   `sudo ufw allow in on $NET_IF`. To confirm the robot's DDS heartbeat without
+   root, join multicast `239.255.0.1:7400` from a plain UDP socket and listen.
+3. `sudo tcpdump -i $NET_IF -c 5 udp port 7400` — packets arriving from `.161`
+   point at a receive-side problem on the PC; no packets at all points at the
+   robot, meaning it is still booting or not in debug mode.
+
+**Remote buttons ignored** — you are most likely holding L1 or R1; press the
+button by itself. If plain buttons are also dead, check that lowstate is
+flowing at all: the button states ride inside `lowstate.wireless_remote`.
 
 
 # 🧩Develop and Contribute
