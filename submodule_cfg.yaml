@@ -17,6 +17,9 @@ mujoco_viewer:
 unitree_cpp:
   install: false
   path: packages/unitree_cpp
+  patches:
+    # scikit-build-core >= 0.8 renamed cmake.minimum-version.
+    - ../../third_party/patches/unitree_cpp.patch
 
 
 # For OmniH2O, motionlib controller
@@ -39,4 +42,3 @@ phc:
 zed_proxy:
   install: false
   path: packages/zed_proxy
-

@@ -396,7 +396,7 @@ class g1_protomotions_tracker_real(g1_protomotions_tracker):
     env: G1RealEnvCfg = G1RealEnvCfg(
         env_type="UnitreeCppEnv",
         unitree=G1UnitreeCfg(
-            net_if="eth0",  # note: change to your network interface
+            net_if="eth0",  # note: change to your USB-Ethernet dongle's interface name (find it with `ip -br addr`)
         ),
         born_place_align=False,
     )
