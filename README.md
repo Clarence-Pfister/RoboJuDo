@@ -22,6 +22,18 @@
 > ```
 >
 > Upstream's default branch is `release`, not `main`.
+>
+> ### License
+>
+> `SPDX-License-Identifier: CC-BY-4.0`
+>
+> Upstream RoboJuDo is licensed under [Creative Commons Attribution 4.0
+> International](https://creativecommons.org/licenses/by/4.0/), and this fork inherits those terms:
+> redistribution and adaptation are permitted, including commercially, provided you give credit and
+> indicate what you changed. GitHub's sidebar reports this repository as having no license because
+> upstream's [`LICENSE`](LICENSE) file states the terms in summary form rather than reproducing the
+> full CC BY 4.0 legal text, which is what GitHub's detector matches against. The file is
+> unmodified from upstream; this line records the identifier explicitly.
 
 <div align="center">
 <h1>RoboJuDo 🤖</h1>
