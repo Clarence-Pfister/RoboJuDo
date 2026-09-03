@@ -30,10 +30,12 @@
 > Upstream RoboJuDo is licensed under [Creative Commons Attribution 4.0
 > International](https://creativecommons.org/licenses/by/4.0/), and this fork inherits those terms:
 > redistribution and adaptation are permitted, including commercially, provided you give credit and
-> indicate what you changed. GitHub's sidebar reports this repository as having no license because
-> upstream's [`LICENSE`](LICENSE) file states the terms in summary form rather than reproducing the
-> full CC BY 4.0 legal text, which is what GitHub's detector matches against. The file is
-> unmodified from upstream; this line records the identifier explicitly.
+> indicate what you changed.
+>
+> Upstream's [`LICENSE`](LICENSE) file stated these terms in summary form. This fork replaces it with
+> the full CC BY 4.0 legal text so the license is unambiguous and machine-detectable; the license
+> itself is unchanged, and HansZ8's copyright line is preserved. This is the one file on `main` that
+> intentionally diverges from upstream, so expect to keep the fork's version when merging upstream.
 
 <div align="center">
 <h1>RoboJuDo 🤖</h1>
